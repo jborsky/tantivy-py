@@ -4,6 +4,7 @@ use crate::{document::Document, query::Query, to_pyerr};
 use pyo3::types::PyDict;
 use pyo3::IntoPyObjectExt;
 use pyo3::{basic::CompareOp, exceptions::PyValueError, prelude::*};
+use pythonize::{depythonize, pythonize};
 use serde::{Deserialize, Serialize};
 use tantivy as tv;
 use tantivy::aggregation::AggregationCollector;
@@ -42,6 +43,43 @@ impl std::fmt::Debug for Fruit {
             Fruit::Order(None) => f.write_str("None"),
         }
     }
+}
+
+/// Open one column per segment, map each DocAddress to its value, and wrap in
+/// the given `FastFieldValue` variant.  Used by `fast_field_values()` to avoid
+/// repeating the same iterator chain for each numeric type.
+macro_rules! read_fast_field_column_values {
+    ($readers:expr, $field:expr, $addrs:expr, $method:ident, $variant:path) => {{
+        let columns: Vec<Option<_>> = $readers
+            .iter()
+            .map(|reader| reader.fast_fields().$method($field).ok())
+            .collect();
+        Ok($addrs
+            .iter()
+            .map(|addr| {
+                columns[addr.segment_ord as usize]
+                    .as_ref()
+                    .and_then(|col| col.first(addr.doc))
+                    .map($variant)
+            })
+            .collect())
+    }};
+}
+
+/// A typed value read from a numeric fast field.
+///
+/// PyO3 converts U64/I64 to Python int and F64 to Python float, so Python
+/// callers receive `int | float` without needing to know the underlying type.
+#[derive(IntoPyObject)]
+enum FastFieldValue {
+    #[pyo3(transparent)]
+    U64(u64),
+    #[pyo3(transparent)]
+    I64(i64),
+    #[pyo3(transparent)]
+    F64(f64),
+    #[pyo3(transparent)]
+    Bool(bool),
 }
 
 #[pyclass(frozen, module = "tantivy.tantivy")]
@@ -133,6 +171,33 @@ impl SearchResult {
             })
             .collect::<PyResult<_>>()?;
         Ok(ret)
+    }
+}
+
+impl Searcher {
+    /// Execute an aggregation from an already-deserialized spec.
+    /// Shared by `aggregate()` and `cardinality()` so neither needs to
+    /// round-trip through JSON or Python when the spec is already a
+    /// `serde_json::Value`.
+    fn aggregate_value(
+        &self,
+        py: Python,
+        query: &Query,
+        aggs: tv::aggregation::agg_req::Aggregations,
+    ) -> PyResult<Py<PyDict>> {
+        let agg_res = py.detach(move || {
+            let agg_collector =
+                AggregationCollector::from_aggs(aggs, Default::default());
+            self.inner
+                .search(query.get(), &agg_collector)
+                .map_err(to_pyerr)
+        })?;
+
+        pythonize(py, &agg_res)
+            .map_err(to_pyerr)?
+            .downcast_into::<PyDict>()
+            .map(|d| d.unbind())
+            .map_err(Into::into)
     }
 }
 
@@ -378,6 +443,13 @@ impl Searcher {
         })
     }
 
+    /// Execute an aggregation query and return the results as a dict.
+    ///
+    /// Args:
+    ///     query (Query): The query that filters the documents to aggregate over.
+    ///     agg (dict): The aggregation specification as a Python dict.
+    ///
+    /// Returns a dict containing the aggregation results.
     #[pyo3(signature = (query, agg))]
     fn aggregate(
         &self,
@@ -385,26 +457,9 @@ impl Searcher {
         query: &Query,
         agg: Py<PyDict>,
     ) -> PyResult<Py<PyDict>> {
-        let py_json = py.import("json")?;
-        let agg_query_str = py_json.call_method1("dumps", (agg,))?.to_string();
-
-        let agg_str = py.detach(move || {
-            let agg_collector = AggregationCollector::from_aggs(
-                serde_json::from_str(&agg_query_str).map_err(to_pyerr)?,
-                Default::default(),
-            );
-            let agg_res = self
-                .inner
-                .search(query.get(), &agg_collector)
-                .map_err(to_pyerr)?;
-
-            serde_json::to_string(&agg_res).map_err(to_pyerr)
-        })?;
-
-        let agg_dict = py_json.call_method1("loads", (agg_str,))?;
-        let agg_dict = agg_dict.downcast::<PyDict>()?;
-
-        Ok(agg_dict.clone().unbind())
+        let aggs: tv::aggregation::agg_req::Aggregations =
+            depythonize(agg.bind(py)).map_err(to_pyerr)?;
+        self.aggregate_value(py, query, aggs)
     }
 
     /// Returns the cardinality of a query.
@@ -421,20 +476,16 @@ impl Searcher {
         query: &Query,
         field_name: &str,
     ) -> PyResult<f64> {
-        let py_json = py.import("json")?;
-        let agg_query = serde_json::json!({
+        let agg_spec = serde_json::json!({
             "cardinality": {
                 "cardinality": {
                     "field": field_name,
                 }
             }
         });
-        let agg_query_str =
-            serde_json::to_string(&agg_query).map_err(to_pyerr)?;
-        let agg_query_dict: Py<PyDict> =
-            py_json.call_method1("loads", (agg_query_str,))?.extract()?;
 
-        let agg_res = self.aggregate(py, query, agg_query_dict)?;
+        let aggs = serde_json::from_value(agg_spec).map_err(to_pyerr)?;
+        let agg_res = self.aggregate_value(py, query, aggs)?;
         let agg_res: &Bound<PyDict> = agg_res.bind(py);
 
         let res = agg_res.get_item("cardinality")?.ok_or_else(|| {
@@ -444,9 +495,7 @@ impl Searcher {
         let value = res_dict.get_item("value")?.ok_or_else(|| {
             PyValueError::new_err("Unexpected aggregation result")
         })?;
-        let res = value.extract::<f64>()?;
-
-        Ok(res)
+        value.extract::<f64>()
     }
 
     /// Returns the overall number of documents in the index.
@@ -466,13 +515,14 @@ impl Searcher {
     #[pyo3(signature = (field_name, field_value))]
     fn doc_freq(
         &self,
+        py: Python,
         field_name: &str,
         field_value: &Bound<PyAny>,
     ) -> PyResult<u64> {
-        // Wrap the tantivy Searcher `doc_freq` method to return a PyResult.
+        // make_term() needs the GIL (Python type extraction); doc_freq() does not.
         let schema = self.inner.schema();
         let term = crate::make_term(schema, field_name, field_value)?;
-        self.inner.doc_freq(&term).map_err(to_pyerr)
+        py.detach(move || self.inner.doc_freq(&term).map_err(to_pyerr))
     }
 
     /// Fetches a document from Tantivy's store given a DocAddress.
@@ -482,13 +532,110 @@ impl Searcher {
     ///         the document that we wish to fetch.
     ///
     /// Returns the Document, raises ValueError if the document can't be found.
-    fn doc(&self, doc_address: &DocAddress) -> PyResult<Document> {
-        let doc: TantivyDocument =
-            self.inner.doc(doc_address.into()).map_err(to_pyerr)?;
-        let named_doc = doc.to_named_doc(self.inner.schema());
-        Ok(crate::document::Document {
-            field_values: named_doc.0,
+    fn doc(&self, py: Python, doc_address: &DocAddress) -> PyResult<Document> {
+        let addr: tv::DocAddress = doc_address.into();
+        py.detach(move || {
+            let doc: TantivyDocument =
+                self.inner.doc(addr).map_err(to_pyerr)?;
+            let named_doc = doc.to_named_doc(self.inner.schema());
+            Ok(crate::document::Document {
+                field_values: named_doc.0,
+            })
         })
+    }
+
+    /// Read a numeric fast field for a batch of DocAddresses without fetching
+    /// stored documents.
+    ///
+    /// Fast fields are column-oriented and support O(1) random access by
+    /// segment-local DocId.  Use this instead of doc().to_dict()[field] when
+    /// you only need a single numeric field for many documents.
+    ///
+    /// The field type is resolved from the schema automatically: u64 and i64
+    /// fields return Python int; f64 fields return Python float; bool fields
+    /// return Python bool.
+    ///
+    /// Args:
+    ///     field_name: Name of a u64, i64, f64, or bool field declared with fast=True.
+    ///     doc_addresses: List of DocAddress objects (e.g. from search().hits).
+    ///
+    /// Returns:
+    ///     A list of values in the same order as doc_addresses.
+    ///     None is returned for any address where the column is absent
+    ///     (e.g. a segment written before the field was added to the schema).
+    ///
+    /// Raises:
+    ///     ValueError: if the field does not exist, is not a fast field, or
+    ///         has an unsupported type (only u64, i64, f64, and bool are supported).
+    #[pyo3(signature = (field_name, doc_addresses))]
+    fn fast_field_values(
+        &self,
+        field_name: &str,
+        doc_addresses: Vec<DocAddress>,
+    ) -> PyResult<Vec<Option<FastFieldValue>>> {
+        let schema = self.inner.schema();
+
+        let field = schema.get_field(field_name).map_err(|_| {
+            PyValueError::new_err(format!("Unknown field: '{field_name}'"))
+        })?;
+        let field_entry = schema.get_field_entry(field);
+        if !field_entry.is_fast() {
+            return Err(PyValueError::new_err(format!(
+                "Field '{field_name}' is not a fast field."
+            )));
+        }
+
+        let field_type = field_entry.field_type().value_type();
+        let segment_readers = self.inner.segment_readers();
+        let num_segments = segment_readers.len();
+
+        // Validate all segment_ords before reading so we don't produce a
+        // partial result on error.
+        for doc_address in &doc_addresses {
+            if doc_address.segment_ord as usize >= num_segments {
+                return Err(PyValueError::new_err(format!(
+                    "Invalid segment_ord: {}",
+                    doc_address.segment_ord
+                )));
+            }
+        }
+
+        // Pre-open one Column per segment so it is not reopened per document.
+        // Column::first() returns Option<T>, so no sentinel value is needed.
+        match field_type {
+            tv::schema::Type::U64 => read_fast_field_column_values!(
+                segment_readers,
+                field_name,
+                doc_addresses,
+                u64,
+                FastFieldValue::U64
+            ),
+            tv::schema::Type::I64 => read_fast_field_column_values!(
+                segment_readers,
+                field_name,
+                doc_addresses,
+                i64,
+                FastFieldValue::I64
+            ),
+            tv::schema::Type::F64 => read_fast_field_column_values!(
+                segment_readers,
+                field_name,
+                doc_addresses,
+                f64,
+                FastFieldValue::F64
+            ),
+            tv::schema::Type::Bool => read_fast_field_column_values!(
+                segment_readers,
+                field_name,
+                doc_addresses,
+                bool,
+                FastFieldValue::Bool
+            ),
+            _ => Err(PyValueError::new_err(format!(
+                "Field '{field_name}' has unsupported type for fast field access. \
+                 Only u64, i64, f64, and bool fast fields are supported."
+            ))),
+        }
     }
 
     fn __repr__(&self) -> PyResult<String> {

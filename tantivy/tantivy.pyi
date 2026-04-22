@@ -404,8 +404,8 @@ class Searcher:
 
     def aggregate(
         self,
-        search_query: Query,
-        agg_query: dict,
+        query: Query,
+        agg: dict,
     ) -> dict:
         pass
 
@@ -418,6 +418,13 @@ class Searcher:
         pass
 
     def doc(self, doc_address: DocAddress) -> Document:
+        pass
+
+    def fast_field_values(
+        self,
+        field_name: str,
+        doc_addresses: list[DocAddress],
+    ) -> list[int | float | bool | None]:
         pass
 
     def doc_freq(self, field_name: str, field_value: Any) -> int:
